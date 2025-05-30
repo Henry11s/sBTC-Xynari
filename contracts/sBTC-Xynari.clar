@@ -205,3 +205,199 @@
     (ok true)
   )
 )
+
+;; Cancel a prediction market
+(define-public (cancel-prediction-market (market-id uint))
+  (let
+    (
+      (market-data (unwrap! (map-get? market-registry { market-id: market-id }) ERROR_INVALID_MARKET_ID))
+    )
+    (asserts! (is-valid-market-id market-id) ERROR_INVALID_MARKET_ID)
+    (asserts! (is-eq tx-sender contract-administrator) ERROR_UNAUTHORIZED)
+    (asserts! (not (get market-is-resolved market-data)) ERROR_MARKET_ALREADY_RESOLVED)
+    (asserts! (not (get market-is-cancelled market-data)) ERROR_MARKET_CANCELLED)
+
+    (map-set market-registry { market-id: market-id }
+      (merge market-data {
+        market-is-cancelled: true
+      })
+    )
+    (ok true)
+  )
+)
+
+;; Withdraw partial stake before prediction market resolution
+(define-public (withdraw-partial-stake (market-id uint) (option-index uint) (withdrawal-amount uint))
+  (let
+    (
+      (market-data (unwrap! (map-get? market-registry { market-id: market-id }) ERROR_INVALID_MARKET_ID))
+      (participant-stake-data (unwrap! (map-get? participant-stakes { market-id: market-id, staker-address: tx-sender }) ERROR_INVALID_MARKET_ID))
+    )
+    (asserts! (is-valid-market-id market-id) ERROR_INVALID_MARKET_ID)
+    (asserts! (not (get market-is-resolved market-data)) ERROR_MARKET_ALREADY_RESOLVED)
+    (asserts! (not (get market-is-cancelled market-data)) ERROR_MARKET_CANCELLED)
+    (asserts! (< option-index (len (get stake-distribution participant-stake-data))) ERROR_INVALID_OPTION)
+    (let
+      (
+        (current-stake-amount (get-list-element-or-default (get stake-distribution participant-stake-data) option-index u0))
+      )
+      (asserts! (>= current-stake-amount withdrawal-amount) ERROR_INVALID_STAKE_AMOUNT)
+
+      (let
+        (
+          (updated-option-totals (update-list-element (get option-stake-totals market-data) option-index 
+            (- (get-list-element-or-default (get option-stake-totals market-data) option-index u0) withdrawal-amount)))
+          (updated-stake-amounts (update-list-element (get stake-distribution participant-stake-data) option-index 
+            (- current-stake-amount withdrawal-amount)))
+        )
+        (map-set market-registry { market-id: market-id }
+          (merge market-data { option-stake-totals: updated-option-totals })
+        )
+
+        (map-set participant-stakes
+          { market-id: market-id, staker-address: tx-sender }
+          { stake-distribution: updated-stake-amounts }
+        )
+
+        (as-contract (stx-transfer? withdrawal-amount (as-contract tx-sender) tx-sender))
+      )
+    )
+  )
+)
+
+;; Claim winnings or refund
+(define-public (claim-rewards-or-refund (market-id uint))
+  (let
+    (
+      (market-data (unwrap! (map-get? market-registry { market-id: market-id }) ERROR_INVALID_MARKET_ID))
+      (participant-stake-data (unwrap! (map-get? participant-stakes { market-id: market-id, staker-address: tx-sender }) ERROR_INVALID_MARKET_ID))
+    )
+    (asserts! (is-valid-market-id market-id) ERROR_INVALID_MARKET_ID)
+    (asserts! (or (get market-is-resolved market-data) (get market-is-cancelled market-data)) ERROR_MARKET_NOT_RESOLVED)
+
+    (if (get market-is-cancelled market-data)
+      (let
+        (
+          (refund-amount (fold + (get stake-distribution participant-stake-data) u0))
+        )
+        (map-delete participant-stakes { market-id: market-id, staker-address: tx-sender })
+        (as-contract (stx-transfer? refund-amount (as-contract tx-sender) tx-sender))
+      )
+      (let
+        (
+          (winning-option-index (unwrap! (get winning-option market-data) ERROR_MARKET_NOT_RESOLVED))
+          (winning-stake-amount (get-list-element-or-default (get stake-distribution participant-stake-data) winning-option-index u0))
+          (total-winning-pool (get-list-element-or-default (get option-stake-totals market-data) winning-option-index u0))
+          (total-market-pool (fold + (get option-stake-totals market-data) u0))
+          (gross-payout (/ (* winning-stake-amount total-market-pool) total-winning-pool))
+          (platform-fee (/ (* gross-payout platform-fee-percentage) u100))
+          (net-payout (- gross-payout platform-fee))
+        )
+        (map-delete participant-stakes { market-id: market-id, staker-address: tx-sender })
+        (as-contract (stx-transfer? net-payout (as-contract tx-sender) tx-sender))
+      )
+    )
+  )
+)
+
+;; Time-based automatic resolution
+(define-public (auto-resolve-markets (max-markets-to-process uint))
+  (let
+    (
+      (total-markets (var-get market-counter))
+      (initial-state { current-market-id: u0, total-market-count: total-markets, remaining-iterations: max-markets-to-process })
+    )
+    (ok (get current-market-id (fold process-market-resolution
+                              (list initial-state)
+                              initial-state)))
+  )
+)
+
+(define-private (process-market-resolution
+  (current-state { current-market-id: uint, total-market-count: uint, remaining-iterations: uint }) 
+  (accumulator { current-market-id: uint, total-market-count: uint, remaining-iterations: uint })
+)
+  (let (
+    (current-market-id (get current-market-id current-state))
+    (total-markets (get total-market-count current-state))
+    (remaining-iterations (get remaining-iterations current-state))
+  )
+    (if (and (< current-market-id total-markets) (> remaining-iterations u0))
+      (let
+        (
+          (market-data (map-get? market-registry { market-id: current-market-id }))
+        )
+        (if (is-some market-data)
+          (let
+            (
+              (market-resolved (match market-data market-info (resolve-if-expired current-market-id market-info) false))
+            )
+            { 
+              current-market-id: (+ current-market-id u1),
+              total-market-count: total-markets,
+              remaining-iterations: (- remaining-iterations u1)
+            }
+          )
+          { 
+            current-market-id: (+ current-market-id u1),
+            total-market-count: total-markets,
+            remaining-iterations: (- remaining-iterations u1)
+          }
+        )
+      )
+      current-state
+    )
+  )
+)
+
+(define-private (resolve-if-expired (market-id uint) (market-data { market-question: (string-ascii 256), market-description: (string-ascii 1024), market-end-block: uint, winning-option: (optional uint), option-stake-totals: (list 20 uint), market-is-resolved: bool, market-is-cancelled: bool }))
+  (if (and (>= stacks-block-height (get market-end-block market-data)) 
+           (not (get market-is-resolved market-data)) 
+           (not (get market-is-cancelled market-data)))
+    (let
+      (
+        (winning-option-index (determine-winning-option (get option-stake-totals market-data)))
+      )
+      (map-set market-registry 
+        { market-id: market-id }
+        (merge market-data {
+          winning-option: (some winning-option-index),
+          market-is-resolved: true
+        })
+      )
+      true
+    )
+    false
+  )
+)
+
+(define-private (determine-winning-option (stake-amounts (list 20 uint)))
+  (let
+    (
+      (highest-stake-amount (fold find-maximum stake-amounts u0))
+    )
+    (unwrap-panic (index-of stake-amounts highest-stake-amount))
+  )
+)
+
+;; Read-only functions
+
+;; Get prediction market details
+(define-read-only (get-market-details (market-id uint))
+  (map-get? market-registry { market-id: market-id })
+)
+
+;; Get prediction market options
+(define-read-only (get-market-options-list (market-id uint))
+  (map-get? market-options { market-id: market-id })
+)
+
+;; Get participant stake details
+(define-read-only (get-participant-stake-details (market-id uint) (staker-address principal))
+  (map-get? participant-stakes { market-id: market-id, staker-address: staker-address })
+)
+
+;; Get contract balance
+(define-read-only (get-contract-stx-balance)
+  (stx-get-balance (as-contract tx-sender))
+)
